@@ -1,0 +1,1090 @@
+---
+title: "SupplementaryCode"
+output: html_document
+date: "2025-03-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load the necessary packages for analysis.  
+```{r}
+library(tidyverse)
+library(MatchIt)
+library(progress)
+library(survival)
+library(broom)
+library(parallel)
+library(foreach)
+library(mediation)
+library(scales)
+library(doParallel)
+library(readxl)
+```
+
+```{r}
+rm(list = ls())
+```
+
+#Load data
+The "sample_data.Rdata" file contains a total of five objects. It includes `phecode_diagnosis` and `phecode_diagnosis_time`, which represent the mapped PheCode diagnosis and the corresponding timestamps for each diagnosis, respectively. These two data frames are congruent in shape and correspond positionally across both frames.
+`death_diagnosis_time` provides the time of patients.
+`baseline_info` provides baseline demographic and clinical information for each patient.
+`icd10_to_phecode` details the mapping relationship between specific diseases and their associated PheCodes.
+
+A subset of the data, comprising 10,000 samples, has been provided to facilitate the execution of the program by users.
+```{r}
+load("sample_data.Rdata")
+```
+
+
+#Data Preparation
+Conduct necessary data cleaning and structuring processes to facilitate analysis.
+```{r}
+# Hyperthyroidism is uniformly coded as 242 for consistency in data analysis.
+phecode_diagnosis <- phecode_diagnosis %>%
+  mutate(across(everything(),~if_else(.x %in% c("242.1", "242.2"),"242",.x)))
+
+# Identify patients diagnosed with hyperthyroidism and generate a logical vector `is_HT`.
+is_HT <- apply(phecode_diagnosis, 1, function(row) {
+  any(row %in% c("242"))
+})
+is_HT[is.na(is_HT)] <- F 
+
+# Retrieve all possible PheCodes present in the dataset.
+df_long <-phecode_diagnosis %>%
+  mutate(id = baseline_info$ID) %>%
+  pivot_longer(-id, names_to = "diagnosis", values_to = "icd_code") %>%
+  filter(!is.na(icd_code))
+all_PheCode <- unique(df_long$icd_code) 
+all_PheCode <- na.omit(all_PheCode)
+all_PheCode <- as.vector(all_PheCode) 
+
+# Determine the positions within the dataset where the diagnosis of hyperthyroidism is recorded.
+HT_position <- apply(phecode_diagnosis[is_HT,], 1, function(row) {
+  HT_position <- match("242", row)
+  return(c( HT_position))
+})
+
+# Retrieve the index date for each patient diagnosed with hyperthyroidism, which corresponds to the date of diagnosis.
+HT_df <- phecode_diagnosis_time[is_HT, ]
+index_date_HT  <- sapply(seq_along(HT_position), function(i) {
+  HT_df[i, HT_position[i]]
+}, USE.NAMES = FALSE)
+index_date_HT <- map_vec(index_date_HT,~.x)
+names(index_date_HT) <- which(is_HT) 
+
+# Retain only those cases of hyperthyroidism diagnosed after January 1, 1997.
+keep_s <- index_date_HT>=as.Date("1997-1-1") 
+exclude_id <- names(index_date_HT[ index_date_HT<as.Date("1997-1-1")])%>%as.numeric()  
+index_date_HT <- index_date_HT[keep_s]
+HT_position <-  HT_position[keep_s]
+is_HT <- is_HT[1:length(is_HT) %in% exclude_id==F]
+phecode_diagnosis <- phecode_diagnosis[1:nrow(phecode_diagnosis) %in% exclude_id==F,]
+phecode_diagnosis_time <- phecode_diagnosis_time[1:nrow(phecode_diagnosis_time) %in% exclude_id==F,]
+baseline_info <- baseline_info[1:nrow(baseline_info) %in% exclude_id==F,]
+names(index_date_HT) <- which(is_HT)
+```
+
+# Propensity Score Matching
+```{r}
+#Data Preparation
+baseline_info <- baseline_info%>%
+  mutate(id_subset=1:nrow(.))%>%
+  mutate(target_diease=abs(is_HT),target_diease=factor(target_diease))%>%
+  left_join(death_diagnosis_time,by="ID")%>%
+  mutate(cencor_date=case_when(assessment_centre_2=="England" ~ ymd("2022-10-31"),
+                               assessment_centre_2=="Scottish" ~ ymd("2022-8-31"),
+                               assessment_centre_2=="Wales" ~ ymd("2022-5-31")),
+         birth_year=cut(baseline_info $year_of_birth,breaks=c(1930,1940,1950,1960,1975),
+                        labels = c("1930-1940","1940-1950","1950-1960",">1960"),include.lowest = T),
+         across(c(Smoking,alcohol,education),factor))
+
+formula <-target_diease~Sex+year_of_birth+Townsend_deprivation_index+assessment_centre+
+  Smoking+alcohol+PA_level+education+BMI
+set.seed(123)
+matched_data <-MatchIt:: matchit(formula=formula,
+                                 data = baseline_info, 
+                                 method = "nearest", 
+                                 distance = "glm",m.order = "random",
+                                 ratio=4,caliper = .1,replace = F)
+
+# Extract data after propensity score matching.
+mdata_HT <- MatchIt::match.data(matched_data) 
+```
+
+# 1. PheWAS analysis
+## Data Organization
+```{r}
+# Exclude control group members who died prior to the index date from the analysis.
+mdata_HT <- mdata_HT%>% 
+  left_join(enframe(index_date_HT,name="id",value="index_date")%>%mutate(id=as.numeric(id)),by=c("id_subset"="id"))%>%
+  dplyr::select(id_subset,subclass,index_date,everything())%>%
+  arrange(subclass,is.na(index_date))%>%
+  fill(index_date,.direction = "down")
+
+# Exclude hyperthyroidism cases where the patient died on the same day as the diagnosis.
+subclass_exclude<- mdata_HT%>%
+  filter(index_date == death_time,target_diease==1)%>%
+  pull(subclass)
+mdata_HT <- mdata_HT%>%
+  filter(!subclass %in% subclass_exclude)%>%
+  filter((index_date %--% death_time)/months(1) >= 0 | is.na(death_time)) 
+
+all_subclass <- unique(mdata_HT$subclass)
+
+# Define a function to remove diagnostic records that occur prior to the index date.
+set_na_before_date <- function(df, cutoff_date) {
+  cutoff_date <- as.Date(cutoff_date)
+  df <- as.data.frame(lapply(df, function(column) {
+    if(is.Date(column) || is.character(column)) {
+      column <- as.Date(column)
+      column[column < cutoff_date] <- NA
+    }
+    return(column)
+  }))
+  df <- tibble(df )
+  return(df)
+}
+
+# Define a function to retrieve diagnostic records that occurred prior to the index date.
+get_before_date <- function(df, cutoff_date) {
+  cutoff_date <- as.Date(cutoff_date)
+  df <- as.data.frame(lapply(df, function(column) {
+    if(is.Date(column) || is.character(column)) {
+      column <- as.Date(column)
+      column[column >= cutoff_date] <- NA
+    }
+    return(column)
+  }))
+  df <- tibble(df )
+  return(df)
+}
+
+PheWAS_format <- list()
+PheWAS_format_date <- list()
+prior_diagnosis <- list()
+
+pb <- progress_bar$new(
+  format = " Running [:bar] :percent eta: :eta",
+  total = length(all_subclass), clear = FALSE, width= 60)
+
+for(i in all_subclass){
+  pb$tick()
+  case_id <- mdata_HT%>%
+    filter(subclass==i)%>%
+    filter(target_diease==1)%>%
+    pull(id_subset)
+  control_id <- mdata_HT%>%
+    filter(subclass==i)%>%
+    filter(target_diease==0)%>%
+    pull(id_subset)
+  index_date_x <- index_date_HT[as.character(case_id)]
+  
+  case_diagnosis_date <- phecode_diagnosis_time[case_id ,]
+  case_diagnosis <- phecode_diagnosis[case_id,]
+
+  control_diagnosis_date <- phecode_diagnosis_time[control_id ,]
+  control_diagnosis <- phecode_diagnosis[control_id,]
+  
+  case_prior_diagnosis <- case_diagnosis
+  case_prior_diagnosis_date <- case_diagnosis_date
+  control_prior_diagnosis <- control_diagnosis
+  control_prior_diagnosis_date <- control_diagnosis_date
+  
+  # Extract diagnostic records that occurred after the index date.
+  case_diagnosis_date <- set_na_before_date(case_diagnosis_date, index_date_x) 
+  case_diagnosis[is.na(case_diagnosis_date)] <- NA
+  control_diagnosis_date <- set_na_before_date(control_diagnosis_date, index_date_x)
+  control_diagnosis[is.na(control_diagnosis_date)] <- NA
+  
+  # Extract diagnostic records occurring before the index date and store them in the `prior_diagnosis` list.
+  case_prior_diagnosis_date <- get_before_date(case_prior_diagnosis_date, index_date_x)
+  case_prior_diagnosis[is.na(case_prior_diagnosis_date)] <- NA
+  prior_diagnosis[[as.character(case_id)]] <- as.vector(t(case_prior_diagnosis[1, ])[!is.na(as.vector(t(case_prior_diagnosis[1, ])))])
+  
+  control_prior_diagnosis_date <- get_before_date(control_prior_diagnosis_date, index_date_x)
+  control_prior_diagnosis[is.na(control_prior_diagnosis_date)] <- NA
+  vector_names <- as.character(control_id)
+  for (z in 1:nrow(control_prior_diagnosis)) {
+    row_vector <- as.vector(t(control_prior_diagnosis[z, ]), mode = "character")
+    row_vector_no_na <- row_vector[!is.na(row_vector)]
+    prior_diagnosis[[vector_names[z]]] <- row_vector_no_na
+  }
+  
+  # Merge case and control groups for subsequent analysis.
+  diagnosis_raw <- bind_rows(case_diagnosis ,control_diagnosis)
+  diagnosis_time_raw <- bind_rows(case_diagnosis_date ,control_diagnosis_date)
+  
+  
+  ID <- c(case_id ,control_id)
+
+  df_long <- diagnosis_raw %>%
+    mutate(id = ID) %>%
+    pivot_longer(-id, names_to = "diagnosis", values_to = "icd_code") %>%
+    filter(!is.na(icd_code))
+
+  wide_df <- matrix(0, nrow = nrow(diagnosis_raw), ncol = length(all_PheCode),
+                    dimnames = list(NULL, all_PheCode))
+
+  for (j in 1:nrow(df_long)) {
+    row <- which(ID == df_long$id[j])
+    icd <- df_long$icd_code[j]
+    if (icd %in%  all_PheCode) {
+      wide_df[row, icd] <- 1
+    }
+  }
+
+  wide_df <- as.data.frame(wide_df)
+  wide_df$ID <- ID 
+  wide_df$target_disease <- if_else(ID %in% control_id ,0 ,1)
+  wide_df$subgroup <- mdata_HT%>%
+    filter(subclass==i)%>%pull(subclass)%>%.[1]
+  wide_df <- cbind(wide_df[c("ID", "target_disease","subgroup")], 
+                   wide_df[, !names(wide_df) %in% c("ID", "target_disease","subgroup")])
+  wide_df <- tibble(wide_df)
+  
+  # Process and format date variables
+  df_long_date <- diagnosis_time_raw %>%
+    mutate(id = ID) %>%
+    pivot_longer(-id, names_to = "diagnosis", values_to = "icd_code") %>%
+    filter(!is.na(icd_code))
+  df_long_date <- df_long_date %>%
+    mutate(icd_code=as.numeric(icd_code ))
+
+  wide_df_date <- matrix(-999.99, nrow = nrow(diagnosis_time_raw), ncol = length(all_PheCode),
+                         dimnames = list(NULL, all_PheCode))
+
+  for (j in 1:nrow(df_long_date)) {
+    row <- which(ID == df_long_date$id[j])
+    icd <- df_long$icd_code[j]
+    if (!is.na(icd)) {
+      wide_df_date[row, icd] <- df_long_date$icd_code[j]
+    }
+  }
+ 
+  wide_df_date <- as.data.frame(wide_df_date)
+  wide_df_date$ID <- ID 
+  wide_df_date$target_disease <- if_else(ID %in% control_id ,0 ,1)
+  wide_df_date$subgroup <- mdata_HT%>%
+    filter(subclass==i)%>%pull(subclass)%>%.[1]
+  wide_df_date <- cbind(wide_df_date[c("ID", "target_disease","subgroup")], 
+                        wide_df_date[, !names(wide_df_date) %in% c("ID", "target_disease","subgroup")])
+  wide_df_date <- tibble(wide_df_date)%>%
+    mutate(across(4:ncol(wide_df_date),~if_else(.x==-999.99,NA_real_,.x)))%>%
+    mutate(across(4:ncol(wide_df_date),~as.Date(.x, origin = "1970-01-01")))
+
+  PheWAS_format[[i]] <- wide_df
+  PheWAS_format_date[[i]] <- wide_df_date
+}
+
+PheWAS_format_HT <- bind_rows(PheWAS_format)
+PheWAS_format_date_HT <- bind_rows(PheWAS_format_date)
+
+PheWAS_format_HT <- PheWAS_format_HT%>%
+  mutate(across(4:ncol(PheWAS_format_HT),factor))
+
+save(mdata_HT,PheWAS_format_HT,PheWAS_format_date_HT, prior_diagnosis,file = "PheWAS_format_HT.Rdata")
+```
+
+## Select candidate phenotypes
+```{r}
+df <- PheWAS_format_HT %>%
+  filter(target_disease == 1) %>%
+  dplyr::select(-1:-3) %>%
+  mutate(across(everything(), ~ as.numeric(as.character(.))))
+
+# For example, phenotypes that co-occurred with hyperthyroidism in at least 10 cases were dplyr::selected as candidate phenotypes.  
+ob_phewas_candidate <- colSums(df) %>%
+  enframe(name = "PheCode", value = "count") %>%
+  filter(count >= 10, PheCode != "242") %>% 
+  pull(PheCode)
+
+PheCode_count <- colSums(df) %>%
+  enframe(name = "PheCode", value = "count")
+```
+
+## Perform stratified Cox regression
+```{r}
+load("PheWAS_format_HT.Rdata")
+# Filter IDs based on geographic regions
+region_ids <- baseline_info %>%
+  dplyr::select(id_subset, assessment_centre_2) %>%
+  split(.$assessment_centre_2) %>%
+  map(pull, id_subset)
+
+# Calculate survival time for each individual.  
+surv_time <- PheWAS_format_date_HT %>%
+  left_join(enframe(index_date_HT, name = "id", value = "index_date") %>% mutate(id = as.numeric(id)), 
+            by = c("ID" = "id")) %>%
+  dplyr::select(ID, index_date, everything()) %>%
+  fill(index_date, .direction = "down") %>%
+  mutate(across(5:ncol(.), ~ if_else(!is.na(.x), (index_date %--% .x) / months(1), NA_real_)))
+
+colnames(surv_time)[5:ncol(surv_time)] <- paste0("date_d", colnames(surv_time)[5:ncol(surv_time)])
+
+# Extract death-related information for analysis.  
+death_data <- death_diagnosis_time %>%
+  filter(ID %in% baseline_info$ID) %>%
+  mutate(ID = baseline_info$id_subset) 
+
+death_ID <- death_data %>% filter(!is.na(death_time)) %>% pull(ID)
+death_date <- death_data %>% filter(ID %in% surv_time$ID)
+
+surv_time <- as.data.frame(surv_time) %>% arrange(ID)
+
+cl <- makeCluster(5)
+clusterEvalQ(cl, { library(tidyverse) })
+registerDoParallel(cl)
+
+results <- foreach(i = 5:ncol(surv_time), .combine = 'cbind', .packages = c("dplyr", "lubridate")) %dopar% {
+  x <- surv_time[[i]]
+  
+  x <- if_else(surv_time$ID %in% death_ID, (surv_time$index_date %--% death_date$death_time) / months(1), x)
+  
+  case_when(
+    is.na(x) & surv_time$ID %in% region_ids$England  ~ (surv_time$index_date %--% ymd("2022-10-31")) / months(1),
+    is.na(x) & surv_time$ID %in% region_ids$Scottish ~ (surv_time$index_date %--% ymd("2022-08-31")) / months(1),
+    is.na(x) & surv_time$ID %in% region_ids$Wales    ~ (surv_time$index_date %--% ymd("2022-05-31")) / months(1),
+    !is.na(x) ~ x,
+    TRUE ~ NA_real_
+  )
+}
+
+stopCluster(cl)
+surv_time[, 5:ncol(surv_time)] <- results
+surv_time <- tibble(surv_time)
+
+# Define the end date of follow-up for each individual.
+censor_date <- surv_time%>% 
+  tibble()%>%
+  mutate(censor_date=if_else(ID %in% death_ID, death_date$death_time ,NA_Date_),
+         censor_date=case_when(is.na(censor_date) & ID %in% region_ids$England ~ymd("2022-10-31"),
+                               is.na(censor_date) & ID %in% region_ids$Scottish ~  ymd("2022-8-31"),
+                               is.na(censor_date) & ID %in% region_ids$Wales ~ ymd("2022-5-31"),
+                               !is.na(censor_date) ~ censor_date,
+                               T ~ NA_Date_))
+
+colnames(PheWAS_format_HT)[4:ncol(PheWAS_format_HT)] <- paste0("d",colnames(PheWAS_format_HT)[4:ncol(PheWAS_format_HT)])
+PheWAS_format_HT <- PheWAS_format_HT%>%
+  mutate(subgroup=factor(subgroup))%>%
+  left_join(surv_time%>%dplyr::select(ID,subgroup,5:ncol(surv_time)),by=c("ID","subgroup"))
+
+PheWAS_format_HT <- PheWAS_format_HT%>%
+  mutate(across(everything(),as.character),
+         across(everything(),as.numeric))
+save(PheWAS_format_HT,file="PheWAS_data.Rdata")
+#load("PheWAS_data.Rdata")
+
+# Conduct PheWAS analysis to identify phenotype associations.  
+models <- list()
+pb <- progress_bar$new(
+  format = " Running [:bar] :percent eta: :eta",
+  total = length(ob_phewas_candidate), clear = FALSE, width= 60)
+for(i in 1:length(ob_phewas_candidate)){
+  pb$tick()
+  
+  Y <- ob_phewas_candidate[i]
+  X <- "target_disease"
+  subgroup <- "pair_id"
+  # 构建公式字符串
+  formula_str <- paste0("Surv(","date_d",Y,",","d",Y,")"," ~ ",X,"+ strata(subgroup)")
+  formula <- as.formula(formula_str)
+  
+  past_diagnosis <- sapply(prior_diagnosis, function(x) ob_phewas_candidate[i] %in% x)
+  past_diagnosis_id <- names(prior_diagnosis)[past_diagnosis]
+  
+  # Exclude individuals who had a prior diagnosis of the disease before index date. 
+  data <- PheWAS_format_HT%>%filter(!ID %in% past_diagnosis_id)
+  # Remove diagnoses that occurred on the same day as cohort entry.  
+  data <- data[data[paste0("date_d",Y)]>0,] 
+  
+  model <- coxph(formula,data = data)
+  models[[i]] <- model
+}
+
+# Extract and review regression results for analysis.  
+results_cox <- lapply(models, tidy)
+results_cox <- results_cox%>%
+  map(~.x%>%
+        dplyr::select(estimate,std.error,p.value))%>%
+  bind_rows()%>%
+  mutate(outcome=ob_phewas_candidate)%>%
+  left_join(icd10_to_phecode%>%
+              dplyr::select(PheCode,Phenotype)%>%
+              mutate(PheCode=as.character(PheCode))%>%
+              distinct(PheCode, .keep_all = T),
+            by=c("outcome"="PheCode"))%>%
+  transmute(PheCode=outcome,Phenotype,estimate,std.error,p.value,HR=exp(estimate))
+
+phewas_sig_phecode <- results_cox%>%filter(p.value<0.05)%>%pull(PheCode)
+
+save(results_cox,file = "ob_cox_phewas_result.Rdata" )
+
+
+```
+
+# 2. landmark analysis
+## Within 2 years since hyperthyroidism
+```{r}
+load("PheWAS_format_HT.Rdata")
+load("PheWAS_data.Rdata")
+censor_date <- censor_date%>%mutate(censordate = censor_date)
+mdata_HT <- mdata_HT%>%
+  left_join(baseline_info%>%mutate(id_subset=1:nrow(baseline_info))%>%dplyr::select(ID,id_subset))%>% 
+  left_join(censor_date%>%dplyr::select(ID,censordate),by=c("id_subset"="ID"))%>%
+  dplyr::select(ID,id_subset,index_date,censordate)%>%
+  mutate(follow_time=(index_date %--% censordate)/months(1))
+
+ob_phewas_candidate <- phewas_sig_phecode
+
+year_2 <- PheWAS_format_HT%>%dplyr::select(1:3)%>%
+  left_join(mdata_HT%>%dplyr::select(id_subset,follow_time),by=c("ID"="id_subset"))
+
+for(i in 1: length(ob_phewas_candidate)){
+  event <- PheWAS_format_HT[[paste0("d",ob_phewas_candidate[i])]] 
+  time <- PheWAS_format_HT[[paste0("date_d",ob_phewas_candidate[i])]] 
+  
+  year_2 <- year_2 %>%
+    mutate(event_overall=event,time_overall=time)%>%
+    mutate(!!paste0("d", ob_phewas_candidate[i]) := abs(event_overall==1 & time_overall<=2*12),
+           !!paste0("d_date", ob_phewas_candidate[i]) := if_else(!!sym(paste0("d", ob_phewas_candidate[i]))==1,
+                                                                 time_overall,follow_time),
+           !!paste0("d_date", ob_phewas_candidate[i]) := if_else(time_overall>2*12,2*12,time_overall ))
+}
+
+models <- list()
+n_analysis <- vector()
+n_case <- vector()
+n_HT_analysis <- vector()
+n_HT_case <- vector()
+for(i in 1:length(ob_phewas_candidate)){
+  Y <- ob_phewas_candidate[i]
+  X <- "target_disease"
+  
+  past_diagnosis <- sapply(prior_diagnosis, function(x) ob_phewas_candidate[i] %in% x)
+  past_diagnosis_id <- names(prior_diagnosis)[past_diagnosis]
+  
+  data <- year_2
+  # Exclude individuals who had a prior diagnosis of the disease before the study period.
+  data <- data%>%
+    filter(!ID %in% c(past_diagnosis_id))
+  # Remove diagnoses that occurred on the same day as cohort entry.
+  data <- data[data[paste0("d_date",ob_phewas_candidate[i])]>0,] 
+  
+  n_analysis[i] <- nrow(data)
+  n_case[i] <- nrow(data%>%filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1))
+  
+  n_HT_analysis[i] <- nrow(data%>%filter(target_disease==1))
+  n_HT_case[i] <- nrow(data%>%filter(target_disease==1)%>%filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1))
+  
+  formula_str <- paste0("Surv(","d_date",Y,",","d",Y,")"," ~ ",X,"+ strata(subgroup)")
+  formula <- as.formula(formula_str)
+  model <- coxph(formula,data = data)
+  models[[i]] <- model
+  
+  message(paste("Iteration", i, "in progress. Overall progress:", 
+                round(i / length(ob_phewas_candidate) * 100, 2), "% completed."))
+  
+}
+
+# Extract and examine regression results
+results_2 <- lapply(models, tidy)
+results_2 <- results_2%>%
+  map(~.x%>%
+        dplyr::select(estimate,std.error,p.value))%>%
+  bind_rows()%>%
+  mutate(n_analysis=n_analysis,n_case=n_case,N_2=paste0(n_case,"/",n_analysis),
+         n_HT_analysis=n_HT_analysis,n_HT_case=n_HT_case,N_HT_2=paste0(n_HT_case,"/",n_HT_analysis))%>%
+  mutate(lower=estimate-1.96*std.error,upper=estimate+1.96*std.error,
+         HR=exp(estimate),
+         HR_format_2=paste0(round(HR,2)," (",round(exp(lower),2),"–",round(exp(upper),2),")") ,
+         p.value=p.adjust(p.value,"b"),
+         p.value_2=signif(p.value,digits = 3),
+         PheCode=ob_phewas_candidate)%>%
+  dplyr::select(PheCode,N_2,N_HT_2,HR_format_2,p.value_2)
+
+
+
+```
+
+## 2 to 5 year since hyperthyroidism
+```{r}
+year_2_5 <- PheWAS_format_HT%>%dplyr::select(1:3)%>%
+  left_join(mdata_HT%>%dplyr::select(id_subset,follow_time),by=c("ID"="id_subset"))
+
+for(i in 1: length(ob_phewas_candidate)){
+  event <- PheWAS_format_HT[[paste0("d",ob_phewas_candidate[i])]] 
+  time <- PheWAS_format_HT[[paste0("date_d",ob_phewas_candidate[i])]] 
+  
+  year_2_5 <- year_2_5 %>%
+    mutate(event_overall=event,time_overall=time)%>%
+    mutate(!!paste0("d", ob_phewas_candidate[i]) := abs(event==1 & time>2*12 &time<=5*12),
+           !!paste0("d_date", ob_phewas_candidate[i]) := if_else(!!sym(paste0("d", ob_phewas_candidate[i]))==1,
+                                                                 time_overall,follow_time),
+           !!paste0("d_date", ob_phewas_candidate[i]) := if_else(time_overall>5*12,5*12,time_overall ),
+           !!paste0("d_date", ob_phewas_candidate[i]) := !!sym(paste0("d_date", ob_phewas_candidate[i])) -2*12)
+  
+  
+}
+
+models <- list()
+n_analysis <- vector()
+n_case <- vector()
+n_HT_analysis <- vector()
+n_HT_case <- vector()
+for(i in 1:length(ob_phewas_candidate)){
+  Y <- ob_phewas_candidate[i]
+  X <- "target_disease"
+  
+  data <- year_2_5 
+  
+  past_diagnosis <- sapply(prior_diagnosis, function(x) ob_phewas_candidate[i] %in% x)
+  past_diagnosis_id <- names(prior_diagnosis)[past_diagnosis]
+  
+  past_diagnosis_id_2 <- year_2 %>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1)%>%pull(ID)
+  loss_followup_id <- year_2_5%>%filter(follow_time<=2*12)%>%pull(ID)
+  
+  # Exclude individuals who had a prior diagnosis of the disease before the study period.  
+  data <- data%>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1|!ID %in% c(past_diagnosis_id,past_diagnosis_id_2,loss_followup_id))
+  
+  # Remove diagnoses that occurred on the same day as cohort entry.
+  data <- data[data[paste0("d_date",ob_phewas_candidate[i])]>0,] 
+  
+  n_analysis[i] <- nrow(data)
+  n_case[i] <- nrow(data%>%filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1))
+  
+  n_HT_analysis[i] <- nrow(data%>%filter(target_disease==1))
+  n_HT_case[i] <- nrow(data%>%filter(target_disease==1)%>%filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1))
+  
+  formula_str <- paste0("Surv(","d_date",Y,",","d",Y,")"," ~ ",X,"+ strata(subgroup)")
+  formula <- as.formula(formula_str)
+  model <- coxph(formula,data = data)
+  models[[i]] <- model
+  
+  message(paste("Iteration", i, "in progress. Overall progress:", 
+              round(i / length(ob_phewas_candidate) * 100, 2), "% completed."))
+}
+
+
+# Extract and examine the regression results for analysis.  
+results_2_5 <- lapply(models, tidy)
+results_2_5 <- results_2_5%>%
+  map(~.x%>%
+        dplyr::select(estimate,std.error,p.value))%>%
+  bind_rows()%>%
+  mutate(n_analysis=n_analysis,n_case=n_case,N_2_5=paste0(n_case,"/",n_analysis),
+         n_HT_analysis=n_HT_analysis,n_HT_case=n_HT_case,N_HT_2_5=paste0(n_HT_case,"/",n_HT_analysis))%>%
+  mutate(lower=estimate-1.96*std.error,upper=estimate+1.96*std.error,
+         HR=exp(estimate),
+         HR_format_2_5=paste0(round(HR,2)," (",round(exp(lower),2),"–",round(exp(upper),2),")") ,
+         p.value=p.adjust(p.value,"b"),
+         p.value_2_5=signif(p.value,digits = 3),
+         PheCode=ob_phewas_candidate)%>%
+  dplyr::select(PheCode,N_2_5,N_HT_2_5,HR_format_2_5,p.value_2_5)
+
+```
+
+## 5 to10 year since hyperthyroidism
+```{r}
+year_5_10 <- PheWAS_format_HT%>%dplyr::select(1:3)%>%
+  left_join(mdata_HT%>%dplyr::select(id_subset,follow_time),by=c("ID"="id_subset"))
+
+for(i in 1: length(ob_phewas_candidate)){
+  event <- PheWAS_format_HT[[paste0("d",ob_phewas_candidate[i])]] 
+  time <- PheWAS_format_HT[[paste0("date_d",ob_phewas_candidate[i])]] 
+  
+  year_5_10 <- year_5_10 %>%
+    mutate(event_overall=event,time_overall=time)%>%
+    mutate(!!paste0("d", ob_phewas_candidate[i]) := abs(event==1 & time>5*12 &time<=10*12),
+           !!paste0("d_date", ob_phewas_candidate[i]) := if_else(!!sym(paste0("d", ob_phewas_candidate[i]))==1,
+                                                                 time_overall,follow_time),
+           !!paste0("d_date", ob_phewas_candidate[i]) := if_else(time_overall>10*12,10*12,time_overall ),
+           !!paste0("d_date", ob_phewas_candidate[i]) := !!sym(paste0("d_date", ob_phewas_candidate[i])) -5*12)
+  
+  
+}
+
+models <- list()
+n_analysis <- vector()
+n_case <- vector()
+n_HT_analysis <- vector()
+n_HT_case <- vector()
+for(i in 1:length(ob_phewas_candidate)){
+  Y <- ob_phewas_candidate[i]
+  X <- "target_disease"
+  
+  data <- year_5_10 
+  
+  past_diagnosis <- sapply(prior_diagnosis, function(x) ob_phewas_candidate[i] %in% x)
+  past_diagnosis_id <- names(prior_diagnosis)[past_diagnosis]
+  
+  past_diagnosis_id_2 <- year_2 %>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1)%>%pull(ID)
+  past_diagnosis_id_2_5 <- year_2_5 %>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1)%>%pull(ID)
+  
+  
+  loss_followup_id <- year_5_10%>%filter(follow_time<=5*12)%>%pull(ID)
+  
+  # Exclude individuals who had a prior diagnosis of the disease before the study period.  
+  data <- data%>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1|!ID %in% c(past_diagnosis_id,past_diagnosis_id_2, past_diagnosis_id_2_5,loss_followup_id))
+  
+  # Remove diagnoses that occurred on the same day as cohort entry.
+  data <- data[data[paste0("d_date",ob_phewas_candidate[i])]>0,] 
+  
+  n_analysis[i] <- nrow(data)
+  n_case[i] <- nrow(data%>%filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1))
+  
+  n_HT_analysis[i] <- nrow(data%>%filter(target_disease==1))
+  n_HT_case[i] <- nrow(data%>%filter(target_disease==1)%>%filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1))
+  
+  # 构建公式字符串
+  formula_str <- paste0("Surv(","d_date",Y,",","d",Y,")"," ~ ",X,"+ strata(subgroup)")
+  formula <- as.formula(formula_str)
+  model <- coxph(formula,data = data)
+  models[[i]] <- model
+  
+  message(paste("Iteration", i, "in progress. Overall progress:", 
+              round(i / length(ob_phewas_candidate) * 100, 2), "% completed."))
+}
+
+# Extract and examine the regression results for analysis.  
+results_5_10 <- lapply(models, tidy)
+results_5_10 <- results_5_10%>%
+  map(~.x%>%
+        dplyr::select(estimate,std.error,p.value))%>%
+  bind_rows()%>%
+  mutate(n_analysis=n_analysis,n_case=n_case,N_5_10=paste0(n_case,"/",n_analysis),
+         n_HT_analysis=n_HT_analysis,n_HT_case=n_HT_case,N_HT_5_10=paste0(n_HT_case,"/",n_HT_analysis))%>%
+  mutate(lower=estimate-1.96*std.error,upper=estimate+1.96*std.error,
+         HR=exp(estimate),
+         HR_format_5_10=paste0(round(HR,2)," (",round(exp(lower),2),"–",round(exp(upper),2),")") ,
+         p.value=p.adjust(p.value,"b"),
+         p.value_5_10=signif(p.value,digits = 3),
+         PheCode=ob_phewas_candidate)%>%
+  dplyr::select(PheCode,N_5_10,N_HT_5_10,HR_format_5_10,p.value_5_10)
+```
+
+## Beyond 10 years since hyperthyroidism
+```{r}
+year_10 <- PheWAS_format_HT%>%dplyr::select(1:3)%>%
+  left_join(mdata_HT%>%dplyr::select(id_subset,follow_time),by=c("ID"="id_subset"))
+
+for(i in 1: length(ob_phewas_candidate)){
+  event <- PheWAS_format_HT[[paste0("d",ob_phewas_candidate[i])]] 
+  time <- PheWAS_format_HT[[paste0("date_d",ob_phewas_candidate[i])]] 
+  
+  year_10 <- year_10 %>%
+    mutate(event_overall=event,time_overall=time)%>%
+    mutate(!!paste0("d", ob_phewas_candidate[i]) := abs(event==1 & time>10*12),
+           !!paste0("d_date", ob_phewas_candidate[i]) := if_else(!!sym(paste0("d", ob_phewas_candidate[i]))==1,
+                                                                 time_overall,follow_time),
+           !!paste0("d_date", ob_phewas_candidate[i]) := !!sym(paste0("d_date", ob_phewas_candidate[i])) -10*12)
+}
+
+models <- list()
+n_analysis <- vector()
+n_HT_analysis <- vector()
+n_HT_case <- vector()
+n_case <- vector()
+for(i in 1:length(ob_phewas_candidate)){
+  Y <- ob_phewas_candidate[i]
+  X <- "target_disease"
+  
+  
+  data <- year_10 
+  
+  past_diagnosis <- sapply(prior_diagnosis, function(x) ob_phewas_candidate[i] %in% x)
+  past_diagnosis_id <- names(prior_diagnosis)[past_diagnosis]
+  
+  past_diagnosis_id_2 <- year_2 %>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1)%>%pull(ID)
+  past_diagnosis_id_2_5 <- year_2_5 %>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1)%>%pull(ID)
+  past_diagnosis_id_5_10 <- year_5_10 %>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1)%>%pull(ID)
+  
+  loss_followup_id <- year_5_10%>%filter(follow_time<=10*12)%>%pull(ID)
+  # Exclude individuals who had a prior diagnosis of the disease before the study period.  
+  data <- data%>%
+    filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1|!ID %in% c( past_diagnosis_id,past_diagnosis_id_2,past_diagnosis_id_2_5,past_diagnosis_id_5_10,loss_followup_id))
+  
+  # Remove diagnoses that occurred on the same day as cohort entry.
+  data <- data[data[paste0("d_date",ob_phewas_candidate[i])]>0,] 
+  
+  n_analysis[i] <- nrow(data)
+  n_case[i] <- nrow(data%>%filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1))
+  
+  n_HT_analysis[i] <- nrow(data%>%filter(target_disease==1))
+  n_HT_case[i] <- nrow(data%>%filter(target_disease==1)%>%filter(!!sym(paste0("d",ob_phewas_candidate[i])) == 1))
+  
+  # 构建公式字符串
+  formula_str <- paste0("Surv(","d_date",Y,",","d",Y,")"," ~ ",X,"+ strata(subgroup)")
+  formula <- as.formula(formula_str)
+  model <- coxph(formula,data = data)
+  models[[i]] <- model
+  
+  message(paste("Iteration", i, "in progress. Overall progress:", 
+              round(i / length(ob_phewas_candidate) * 100, 2), "% completed."))
+}
+
+
+# Extract and examine the regression results for analysis.  
+results_10 <- lapply(models, tidy)
+results_10 <- results_10%>%
+  map(~.x%>%
+        dplyr::select(estimate,std.error,p.value))%>%
+  bind_rows()%>%
+  mutate(n_analysis=n_analysis,n_case=n_case,N_10=paste0(n_case,"/",n_analysis),
+         n_HT_analysis=n_HT_analysis,n_HT_case=n_HT_case,N_HT_10=paste0(n_HT_case,"/",n_HT_analysis))%>%
+  mutate(lower=estimate-1.96*std.error,upper=estimate+1.96*std.error,
+         HR=exp(estimate),
+         HR_format_10=paste0(round(HR,2)," (",round(exp(lower),2),"–",round(exp(upper),2),")") ,
+         p.value=p.adjust(p.value,"b"),
+         p.value_10=signif(p.value,digits = 3),
+         PheCode=ob_phewas_candidate)%>%
+  dplyr::select(PheCode,N_10,N_HT_10,HR_format_10,p.value_10)
+
+```
+
+## Output the landmark results
+```{r}
+landmark_res <- results_cox%>% 
+  mutate(lower=estimate-1.96*std.error,upper=estimate+1.96*std.error,HR=exp(estimate),
+         HR_format=paste0(round(HR,2)," (",round(exp(lower),2),"–",round(exp(upper),2),")") )%>%
+  filter(p.value<0.05)%>%
+  transmute(PheCode,Phenotype,HR_format)%>%
+  left_join(results_2%>%transmute(PheCode,HR_2=HR_format_2),by=c("PheCode"))%>%
+  left_join(results_2_5%>%transmute(PheCode,HR_2_5=HR_format_2_5),by=c("PheCode"))%>%
+  left_join(results_5_10%>%transmute(PheCode,HR_5_10=HR_format_5_10),by=c("PheCode"))%>%
+  left_join(results_10%>%transmute(PheCode,HR_10=HR_format_10),by=c("PheCode"))
+landmark_res
+
+```
+
+
+# 3. Disease trajectory analysis
+This analysis is conducted only among individuals diagnosed with hyperthyroidism.  
+## Data Organization
+```{r}
+## For each hyperthyroidism case, remove diagnostic records occurring before the index date.  
+set_na_before_date <- function(df, cutoff_date) {
+  df <- as.data.frame(lapply(df, function(column) {
+    if(is.Date(column) || is.character(column)) {
+      column <- as.Date(column)
+      column[column < cutoff_date] <- NA
+    }
+    return(column)
+  }))
+  df <- tibble(df )
+  return(df)
+}
+
+case_diagnosis <- phecode_diagnosis[is_HT,]
+case_diagnosis_time <- phecode_diagnosis_time[is_HT,]
+
+case_diagnosis_time <- set_na_before_date(case_diagnosis_time, index_date_HT)
+case_diagnosis[is.na(case_diagnosis_time)] <- NA
+```
+
+## Step 1: Select all possible disease pairs for analysis.  
+```{r}
+# Function: Compute disease pairs for each case.  
+calculate_disease_pairs <- function(diseases) {
+  if(length(diseases) >= 2) {
+    pairs <- t(combn(diseases, 2))
+    return(as.data.frame(pairs))
+  } else {
+    return(data.frame(V1 = NA, V2 = NA)) 
+  }
+}
+phewas_sig_phecode <- results_cox%>%filter(p.value<0.05)%>%pull(PheCode)
+
+icd10_diagnosis_HT <- case_diagnosis
+# Consider only diseases dplyr::selected through the PheWAS analysis; convert others to NA.  
+icd10_diagnosis_HT <- icd10_diagnosis_HT%>%
+  mutate(across(everything(),~if_else(.x %in% phewas_sig_phecode,.x ,NA_character_)))
+
+df_long <- icd10_diagnosis_HT %>%
+  mutate(id = row_number()) %>% 
+  pivot_longer(-id, names_to = "diagnosis", values_to = "icd_code") %>%
+  filter(!is.na(icd_code))  
+n_distinct(df_long$icd_code)
+
+# Extract all disease pairs for each individual.  
+disease_pairs <- df_long %>%
+  group_by(id) %>%
+  summarise(diseases = list(icd_code)) %>%
+  rowwise() %>%
+  mutate(pairs = list(calculate_disease_pairs(diseases))) %>%
+  dplyr::select(-diseases) %>%
+  unnest(pairs)  
+
+# Compare the timing between disease pairs.  
+find_position_in_row <- function(disease_code, row) {
+  if (is.na(disease_code)) {
+    return(NA)
+  }
+  pos <- which(case_diagnosis[row, ] == disease_code)
+  return(ifelse(length(pos) > 0, pos[1], NA))
+}
+
+batch_size <- 200
+num_batches <- ceiling(nrow(disease_pairs) / batch_size)
+batches <- split(disease_pairs, ceiling(seq_len(nrow(disease_pairs)) / batch_size))
+
+cl <- makeCluster(5)
+parallel::clusterExport(cl=cl,varlist = c("batches","case_diagnosis","find_position_in_row"))
+parallel::clusterEvalQ(cl=cl,{library(dplyr); library(tidyr); library(purrr); library(tibble)})
+
+res <- pbapply::pblapply(cl=cl,X=batches,FUN = function(x){
+  x_pos <- x %>%
+    mutate(
+      V1_pos = mapply(find_position_in_row, V1, id),
+      V2_pos = mapply(find_position_in_row, V2, id)
+    )
+  return(x_pos)
+})
+stopCluster(cl)
+
+disease_pairs <- bind_rows(res)
+
+disease_pairs <- disease_pairs%>%
+  filter(is.na(V1)==F)  
+
+# Extract dates.
+
+# Define a function to extract dates from specific rows and columns.  
+get_date_from_position <- function(row, pos) {
+  return(case_diagnosis_time[row, pos])
+}
+
+disease_pairs <- disease_pairs %>%
+  filter(!is.na(V1_pos))%>%
+  mutate(
+    V1_date = mapply(get_date_from_position, id, V1_pos),
+    V2_date = mapply(get_date_from_position, id, V2_pos),
+    V1_date=as_vector(V1_date),V1_date=as.Date(V1_date, origin = "1970-01-01"),
+    V2_date=as_vector(V2_date),V2_date=as.Date(V2_date, origin = "1970-01-01")
+  )
+
+
+disease_pairs <- disease_pairs %>%
+  filter(V1_date<V2_date )# Filter disease pairs where the diagnosis in V1 occurred before V2.  
+
+# Count the frequency of each ordered pair.  
+disease_pair_counts <- disease_pairs %>%
+  count(V1, V2)  
+
+# Calculate the co-occurrence frequency of two diseases (unordered).  
+disease_pair_total_count <- disease_pair_counts%>%
+  mutate(
+    Disease1 = as.character(pmin(V1, V2)),
+    Disease2 = as.character(pmax(V1, V2))
+  ) %>%
+  group_by(Disease1, Disease2)%>%
+  summarise(total_n=sum(n))    
+
+# Merge data and prepare for the binomial test analysis.  
+disease_pair_counts_format <- disease_pair_counts %>%
+  mutate(
+    Disease1 = as.character(pmin(V1, V2)),
+    Disease2 = as.character(pmax(V1, V2))
+  ) %>%
+  left_join(disease_pair_total_count ,by=c("Disease1","Disease2"))
+```
+
+## Step 2: Conduct binomial test to evaluate the sequential relationship of D1→D2
+```{r}
+# Define a function to perform the binomial test.  
+binom_test_p_value <- function(x, n) {
+  p.value <- binom.test(x, n, p = 0.5)$p.value
+  estimate <- binom.test(x, n, p = 0.5)$estimate
+  return(list(p.value,estimate))
+}
+
+# Use `mapply` to apply the binomial test.  
+res <- mapply(binom_test_p_value, disease_pair_counts_format$n, disease_pair_counts_format$total_n)
+
+step2_res <- res%>%t()%>%as.data.frame()%>%tibble()%>%
+  mutate(across(everything(),as.double))%>%
+  rename(p.value=V1,estimate=V2)
+
+# Review the results of Step 2.
+disease_pair_HT_selected <-  disease_pair_counts_format%>%
+  mutate(estimate=step2_res$estimate,
+         p_value = step2_res$p.value)%>%
+  filter(estimate>0.5,p_value<0.05) 
+
+```
+
+## Step 3: Calculate the effect of D1 on the risk of D2  
+```{r}
+
+selected_pairs <- disease_pair_HT_selected %>%
+  mutate(selected_pairs=paste0(V1," to ",V2))%>%
+  pull(selected_pairs)
+disease_pairs_filtered <- disease_pairs%>%
+  mutate(pairs=paste0(V1," to ",V2))%>%
+  filter(pairs %in% selected_pairs) # Retain only the disease pairs dplyr::selected in step 2.  
+
+baseline_info_HT <- baseline_info%>%filter(target_diease==1)
+id_case_40w <- PheWAS_format_HT%>%filter(target_disease==1)%>%pull(ID)
+baseline_info <- baseline_info%>%filter(id_subset %in% id_case_40w)
+prior_diagnosis <- prior_diagnosis[names(prior_diagnosis) %in% id_case_40w]
+
+#pair <- selected_pairs[1]
+f <- function(pair){
+  
+  D1 <- str_extract(pair, "\\d+\\.?\\d*")
+  D2 <- str_extract(str_extract(pair, "\\d+\\.?\\d*$"), "\\d+\\.?\\d*")
+  
+  # Exclude individuals diagnosed with D1 or D2 before the index date, and remove those diagnosed with D2 before D1.  
+  past_diagnosis_D1 <- sapply(prior_diagnosis, function(x) D1 %in% x)
+  past_diagnosis_D1_id <- names(prior_diagnosis)[past_diagnosis_D1]
+  
+  past_diagnosis_D2 <- sapply(prior_diagnosis, function(x) D2 %in% x)
+  past_diagnosis_D2_id <- names(prior_diagnosis)[past_diagnosis_D2]
+  
+  
+  d2_d1_id <- disease_pairs_filtered%>%filter(V1==D2,V2==D1)%>%pull(id) 
+  ID_d2_d1_id_subset<- baseline_info_HT%>%mutate(id_5839=1:nrow(.))%>%filter(id_5839 %in% d2_d1_id)%>%pull(id_subset)
+  
+  d1_d2_id <- disease_pairs_filtered%>%filter(V1==D1,V2==D2)%>%pull(id) 
+  ID_d1_d2_id_subset<- baseline_info_HT%>%mutate(id_5839=1:nrow(.))%>%filter(id_5839 %in% d1_d2_id)%>%pull(id_subset)
+  
+  d1_id_subset <- PheWAS_format_HT%>%filter(target_disease==1,!!sym(paste0("d",D1)) == 1)%>%pull(ID)
+  d2_id_subset <- PheWAS_format_HT%>%filter(target_disease==1,!!sym(paste0("d",D2)) == 1)%>%pull(ID)
+  
+  data <- baseline_info%>%
+    mutate(id_case=1:nrow(.))%>%
+    filter(!id_subset %in% c(past_diagnosis_D1_id,past_diagnosis_D2_id,ID_d2_d1_id_subset))%>%
+    mutate(d1=abs(id_subset %in% d1_id_subset),d1=factor(d1),
+           d2=abs(id_subset %in% d2_id_subset),
+           d1_d2=abs(id_subset %in% ID_d1_d2_id_subset))
+  
+  
+  formula <- d2 ~ d1 +Sex+year_of_birth+Townsend_deprivation_index+assessment_centre+Smoking+alcohol+PA_level+education+BMI 
+  mf <- glm(formula , data= data ,family = binomial())
+  res <- tidy(mf)%>%filter(term=="d11")
+  
+  return(tibble(disease_pair=pair ,
+                analysis_n=nrow(data),
+                exposure=D1,outcome=D2,
+                estimate=res$estimate,
+                std.error=res$std.error,
+                p_value=res$p.value))
+}
+
+
+cl <- makeCluster(5)
+parallel::clusterExport(cl=cl,varlist = c("disease_pairs_filtered","is_HT","PheWAS_format_HT",
+                                          "baseline_info","baseline_info_HT","prior_diagnosis"))
+parallel::clusterEvalQ(cl=cl, {
+  library(dplyr); library(tidyr); library(purrr); library(tibble);library(stringr)
+  library(broom)
+  library(survival)
+})
+
+res <- pbapply::pblapply(cl=cl,X=selected_pairs,FUN = f)
+stopCluster(cl)
+
+# Review the results of the Step 3.  
+step3_result <- bind_rows(res)%>%
+  mutate(HR=exp(estimate))%>%
+  filter(HR>1,p_value<0.05)
+
+
+```
+
+## Step 4: Conduct mediation analysis to link disease trajectories of length 3.  
+```{r}
+load("PheWAS_data.Rdata")
+PheWAS_format_HT <- PheWAS_format_HT%>%
+  left_join(index_date_HT%>%enframe(value = "index_date",name = "id_subset")%>%
+              mutate(id_subset=as.numeric(id_subset)),
+            by=c("ID"="id_subset"))%>%
+  left_join(baseline_info%>%dplyr::select(id_subset,year_of_birth,Sex,Townsend_deprivation_index,assessment_centre,
+                                                                        Smoking,alcohol,PA_level,education,BMI),by=c("ID"="id_subset"))%>%
+  fill(index_date,.direction = "down")%>%
+  mutate(index_year=year(index_date),
+         age=index_year-year_of_birth)%>%
+  dplyr::select(ID ,target_disease, subgroup,index_date,everything())
+
+
+PheWAS_format_HT$d242 <- PheWAS_format_HT$target_disease
+
+# Extract all possible length-3 disease trajectories.  
+step3_result
+data <- step3_result%>%transmute(D1=exposure,D2=outcome)
+paths_all <- data.frame(D1 = character(), D2 = character(), D3 = character(), stringsAsFactors = FALSE)
+
+for (i in 1:nrow(data)) {
+  for (j in 1:nrow(data)) {
+    if (data$D2[i] == data$D1[j]) {
+      for (k in 1:nrow(data)) {
+        if (data$D2[j] == data$D1[k]) {
+          new_row <- c(data$D1[i], data$D2[i], data$D2[j])
+          paths_all <- rbind(paths_all, as.data.frame(t(new_row), col.names = c("D1", "D2", "D3")))
+        }
+      }
+    }
+  }
+}
+
+paths_all <- paths_all%>%distinct(V1,V2,V3)%>%transmute(D1=V1,D2=V2,D3=V3)
+
+# Perform mediation analysis.  
+res <- list()
+i=1
+for(i in 1:nrow(paths_all)){
+  message(i,"/",nrow(paths_all))
+  
+  X <- paths_all[i,]$D1
+  M <- paths_all[i,]$D2
+  Y <- paths_all[i,]$D3
+  X <- paste0("d",X);M <- paste0("d",M);Y <- paste0("d",Y)
+  
+  formula_1 <- as.formula(paste0(Y ,"~age+Sex+Townsend_deprivation_index+
+  Smoking+alcohol+PA_level+education+BMI+" ,X))
+  fit_total = lm(formula_1 ,PheWAS_format_HT)
+  #summary(fit_total)
+  
+  formula_2 <- as.formula(paste0(M ,"~age+Sex+Townsend_deprivation_index+
+  Smoking+alcohol+PA_level+education+BMI+" ,X))
+  fit_mediator = lm(formula_2 ,PheWAS_format_HT)
+  #summary(fit_mediator)
+  
+  formula_3 <- as.formula(paste0(Y ,"~" ,X,"+age+Sex+Townsend_deprivation_index+
+  Smoking+alcohol+PA_level+education+BMI+",M))
+  fit_direct = lm(formula_3 ,PheWAS_format_HT)
+  #summary(fit_direct)
+  
+  results = mediate(
+    model.m  = fit_mediator,
+    model.y  = fit_direct,
+    treat    = X,
+    mediator = M,
+    boot     = TRUE,sims = 500
+  )
+  #summary(results)
+  
+  res[[i]] <- paths_all[i,]
+  res[[i]] <- res[[i]] %>%
+    mutate(direct_effect=results$z0 ,direct_effect_lower=results$z0.ci[1],direct_effect_upper=results$z0.ci[2],direct_effect_p=results$z0.p,
+           indirect_effect=results$d1,indirect_effect_lower=results$d1.ci[1],indirect_effect_upper=results$d1.ci[2],indirect_effect_p=results$d1.p,
+           total_effect=results$tau.coef,total_effect_lower=results$tau.ci[1],total_effect_upper=results$tau.ci[2],total_effect_p=results$tau.p,
+           prop_mediated=results$n1)
+  
+  
+}
+
+mediation_analysis_result <- bind_rows(res)
+
+```
+
